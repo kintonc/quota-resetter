@@ -34,6 +34,53 @@ def iso(value: Optional[int]) -> str:
     return datetime.fromtimestamp(value or now(), timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def format_timestamp_human(ts: Optional[int]) -> Optional[str]:
+    if not isinstance(ts, (int, float)):
+        return None
+    dt = datetime.fromtimestamp(ts, timezone.utc).astimezone()
+    offset = dt.strftime("%z")
+    offset_fmt = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+    tz_name = dt.tzname() or ""
+    time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+    return f"{time_str} {tz_name} ({offset_fmt})".strip()
+
+
+def relative_time(ts: Optional[int]) -> Optional[str]:
+    if not isinstance(ts, (int, float)):
+        return None
+    diff = int(ts - now())
+    if diff > 0:
+        mins, secs = divmod(diff, 60)
+        hours, mins = divmod(mins, 60)
+        if hours:
+            return f"in {hours}h {mins}m"
+        return f"in {mins}m {secs}s"
+    diff_past = abs(diff)
+    mins, secs = divmod(diff_past, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h {mins}m ago"
+    return f"{mins}m {secs}s ago"
+
+
+def format_status(state: dict[str, Any], raw: bool = False) -> dict[str, Any]:
+    if raw:
+        return state
+    formatted = json.loads(json.dumps(state))
+    services = formatted.get("services")
+    if isinstance(services, dict):
+        for service, s_state in services.items():
+            if isinstance(s_state, dict):
+                for key in ("expected_reset", "kicked_reset"):
+                    val = s_state.get(key)
+                    if isinstance(val, (int, float)):
+                        s_state[f"{key}_unix"] = int(val)
+                        s_state[key] = format_timestamp_human(int(val))
+                        if key == "expected_reset":
+                            s_state["time_remaining"] = relative_time(int(val))
+    return formatted
+
+
 def log(message: str) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     line = f"{iso(None)}  {message}"
@@ -268,11 +315,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="log due actions without running either CLI")
     parser.add_argument("--status", action="store_true", help="show state and exit")
+    parser.add_argument("--raw", action="store_true", help="show raw unix timestamps in status output")
     parser.add_argument("--service", choices=("all", "codex", "claude", "antigravity"), default="all")
     args = parser.parse_args()
     state = load_state()
     if args.status:
-        print(json.dumps(state, indent=2))
+        print(json.dumps(format_status(state, raw=args.raw), indent=2))
         return 0
     if args.service in ("all", "codex"):
         service_cycle("codex", five_hour_reset(rpc_read_codex_limits()), state, args.dry_run)

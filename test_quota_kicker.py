@@ -33,6 +33,7 @@ class TestAntigravityStatusLimits(unittest.TestCase):
             }
             env = os.environ.copy()
             env["HOME"] = str(home)
+            env["USERPROFILE"] = str(home)
             proc = subprocess.run(
                 [sys.executable, str(script)],
                 input=json.dumps(payload),
@@ -146,6 +147,24 @@ class TestQuotaKickerAntigravity(unittest.TestCase):
                 with patch.object(quota_kicker, "save_state"):
                     exit_code = quota_kicker.main()
                     self.assertEqual(exit_code, 0)
+
+    def test_format_status_human_and_raw(self):
+        state = {
+            "services": {
+                "antigravity": {
+                    "expected_reset": 1789337551,
+                }
+            }
+        }
+        human = quota_kicker.format_status(state, raw=False)
+        self.assertIn("expected_reset", human["services"]["antigravity"])
+        self.assertIn("expected_reset_unix", human["services"]["antigravity"])
+        self.assertEqual(human["services"]["antigravity"]["expected_reset_unix"], 1789337551)
+        self.assertIsInstance(human["services"]["antigravity"]["expected_reset"], str)
+        self.assertIn("time_remaining", human["services"]["antigravity"])
+
+        raw = quota_kicker.format_status(state, raw=True)
+        self.assertEqual(raw, state)
 
 
 if __name__ == "__main__":

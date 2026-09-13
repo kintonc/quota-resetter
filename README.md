@@ -66,6 +66,8 @@ The computer must be running for the exact minute. Windows' `StartWhenAvailable`
 ## Operational notes
 
 - State and logs live in `~/.quota-kicker/` (`state.json` and `quota-kicker.log`).
+  - View recent logs on Windows: `Get-Content ~\.quota-kicker\quota-kicker.log -Tail 20`
+  - View recent logs on macOS: `tail -n 20 ~/.quota-kicker/quota-kicker.log`
 - Codex runs with `--ephemeral`, outside repositories, and ignores user/project instructions. Claude runs with `--no-session-persistence`. Antigravity runs non-interactively in headless mode with `-p` from `~/.quota-kicker`.
 - To remove it: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.quota-kicker.plist` on macOS; `Unregister-ScheduledTask -TaskName "Quota Kicker" -Confirm:$false` in Windows PowerShell.
 - The Codex app-server API is experimental and can change with CLI releases. Run `python3 quota_kicker.py --service codex` after updating Codex to confirm it still observes a timestamp.
