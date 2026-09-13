@@ -24,6 +24,8 @@ CLAUDE_LIMITS = Path.home() / ".claude_limits.json"
 ANTIGRAVITY_LIMITS = Path.home() / ".antigravity_limits.json"
 PROMPT = "Reply with exactly: OK"
 GRACE_SECONDS = 75
+FIVE_HOUR_SECONDS = 5 * 60 * 60
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def now() -> int:
@@ -118,6 +120,20 @@ def find_executable(service: str) -> Optional[str]:
         local_fallback = Path.home() / ".local" / "bin" / name
         if local_fallback.is_file() and os.access(local_fallback, os.X_OK):
             return str(local_fallback)
+        # Windows fallback paths
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            lad = Path(local_app_data)
+            win_candidates = [
+                lad / "agy" / "bin" / f"{name}.exe",
+                lad / "Programs" / "OpenAI" / "Codex" / "bin" / f"{name}.exe",
+                Path.home() / ".codex" / "packages" / "standalone" / "current" / "bin" / f"{name}.exe",
+                lad / "Programs" / "Antigravity" / "bin" / f"{name}.exe",
+                Path.home() / ".local" / "bin" / f"{name}.exe",
+            ]
+            for win_path in win_candidates:
+                if win_path.is_file():
+                    return str(win_path)
     return None
 
 
@@ -147,7 +163,7 @@ def rpc_read_codex_limits() -> Optional[dict[str, Any]]:
         proc = subprocess.Popen(
             [executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            encoding="utf-8",
+            encoding="utf-8", creationflags=NO_WINDOW,
         )
         assert proc.stdin and proc.stdout
         # JSON-RPC initialization required by the Codex app-server protocol.
@@ -285,7 +301,8 @@ def run_kick(service: str, dry_run: bool) -> bool:
         return True
     try:
         result = subprocess.run(command, cwd=APP_DIR, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=120, check=False)
+                                stderr=subprocess.DEVNULL, timeout=120, check=False,
+                                creationflags=NO_WINDOW)
         if result.returncode == 0:
             log(f"{service.upper()} kick succeeded")
             return True
@@ -302,11 +319,25 @@ def service_cycle(service: str, observed_reset: Optional[int], state: dict[str, 
         service_state["expected_reset"] = observed_reset
         log(f"{service.upper()} observing next reset: {iso(observed_reset)}")
         return
+    kicked = service_state.get("kicked_reset")
+    if service in ("claude", "antigravity") and isinstance(expected, int) and kicked == expected and now() >= expected:
+        next_reset = expected + FIVE_HOUR_SECONDS
+        service_state["expected_reset"] = next_reset
+        log(f"{service.upper()} next reset after previous kick: {iso(next_reset)}")
+        return
     # Act on the stored timestamp before accepting a newer backend timestamp.
-    if isinstance(expected, int) and now() >= expected + GRACE_SECONDS and service_state.get("kicked_reset") != expected:
+    if isinstance(expected, int) and now() >= expected + GRACE_SECONDS and kicked != expected:
         if run_kick(service, dry_run):
-            service_state["kicked_reset"] = expected
+            if not dry_run:
+                service_state["kicked_reset"] = expected
+                if service in ("claude", "antigravity"):
+                    next_reset = now() + FIVE_HOUR_SECONDS
+                    service_state["expected_reset"] = next_reset
+                    log(f"{service.upper()} next reset after kick: {iso(next_reset)}")
+                    return
     if observed_reset and observed_reset != expected:
+        if service in ("claude", "antigravity") and isinstance(kicked, int) and observed_reset <= kicked:
+            return
         service_state["expected_reset"] = observed_reset
         log(f"{service.upper()} next reset: {iso(observed_reset)}")
 
@@ -328,7 +359,8 @@ def main() -> int:
         service_cycle("claude", claude_reset(), state, args.dry_run)
     if args.service in ("all", "antigravity"):
         service_cycle("antigravity", antigravity_reset(), state, args.dry_run)
-    save_state(state)
+    if not args.dry_run:
+        save_state(state)
     return 0
 
 

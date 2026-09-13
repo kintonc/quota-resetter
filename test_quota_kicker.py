@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Automated tests for Quota Kicker and Antigravity support."""
+import io
 import json
 import os
 import subprocess
@@ -130,9 +131,33 @@ class TestQuotaKickerAntigravity(unittest.TestCase):
             mock_which.side_effect = lambda cmd: "/usr/local/bin/agy" if cmd == "agy" else None
             self.assertEqual(quota_kicker.find_executable("antigravity"), "/usr/local/bin/agy")
 
+    def test_find_antigravity_windows_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executable = Path(tmpdir) / "agy" / "bin" / "agy.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            with patch("shutil.which", return_value=None), patch.dict(os.environ, {"LOCALAPPDATA": tmpdir}):
+                self.assertEqual(quota_kicker.find_executable("antigravity"), str(executable))
+
+    def test_codex_limit_query_uses_no_window(self):
+        responses = (
+            '{"id": 1, "result": {}}\n'
+            '{"id": 2, "result": {"rateLimits": {"primary": {"windowDurationMins": 300}}}}\n'
+        )
+        with patch.object(quota_kicker, "find_executable", return_value="C:/fake/codex.exe"):
+            with patch("subprocess.Popen") as mock_popen:
+                process = mock_popen.return_value
+                process.stdin = io.StringIO()
+                process.stdout = io.StringIO(responses)
+
+                result = quota_kicker.rpc_read_codex_limits()
+
+                self.assertIn("primary", result)
+                self.assertEqual(mock_popen.call_args.kwargs["creationflags"], quota_kicker.NO_WINDOW)
+
     def test_run_kick_antigravity(self):
         with patch.object(quota_kicker, "find_executable", return_value="/fake/agy"):
-            with patch("subprocess.run") as mock_run:
+            with patch.object(quota_kicker, "log"), patch("subprocess.run") as mock_run:
                 mock_run.return_value.returncode = 0
                 result = quota_kicker.run_kick("antigravity", dry_run=False)
                 self.assertTrue(result)
@@ -140,11 +165,85 @@ class TestQuotaKickerAntigravity(unittest.TestCase):
                 args, kwargs = mock_run.call_args
                 self.assertEqual(args[0], ["/fake/agy", "-p", "Reply with exactly: OK"])
                 self.assertEqual(kwargs["cwd"], quota_kicker.APP_DIR)
+                self.assertEqual(kwargs["creationflags"], quota_kicker.NO_WINDOW)
+
+    def test_successful_claude_kick_schedules_next_window(self):
+        reset = 1_700_000_000
+        state = {"services": {"claude": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 76):
+            with patch.object(quota_kicker, "run_kick", return_value=True):
+                quota_kicker.service_cycle("claude", reset, state, dry_run=False)
+
+        claude = state["services"]["claude"]
+        self.assertEqual(claude["kicked_reset"], reset)
+        self.assertEqual(claude["expected_reset"], reset + 76 + 5 * 60 * 60)
+
+    def test_successful_antigravity_kick_schedules_next_window(self):
+        reset = 1_700_000_000
+        state = {"services": {"antigravity": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 76):
+            with patch.object(quota_kicker, "run_kick", return_value=True):
+                quota_kicker.service_cycle("antigravity", reset, state, dry_run=False)
+
+        antigravity = state["services"]["antigravity"]
+        self.assertEqual(antigravity["kicked_reset"], reset)
+        self.assertEqual(antigravity["expected_reset"], reset + 76 + 5 * 60 * 60)
+
+    def test_claude_ignores_snapshot_from_kicked_window(self):
+        kicked_reset = 1_700_000_000
+        expected_reset = kicked_reset + 5 * 60 * 60
+        state = {
+            "services": {
+                "claude": {
+                    "expected_reset": expected_reset,
+                    "kicked_reset": kicked_reset,
+                }
+            }
+        }
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=expected_reset - 60):
+            quota_kicker.service_cycle("claude", kicked_reset, state, dry_run=False)
+
+        self.assertEqual(state["services"]["claude"]["expected_reset"], expected_reset)
+
+    def test_existing_claude_kick_advances_stored_reset(self):
+        reset = 1_700_000_000
+        state = {
+            "services": {
+                "claude": {
+                    "expected_reset": reset,
+                    "kicked_reset": reset,
+                }
+            }
+        }
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 120):
+            quota_kicker.service_cycle("claude", reset, state, dry_run=False)
+
+        self.assertEqual(state["services"]["claude"]["expected_reset"], reset + 5 * 60 * 60)
+
+    def test_existing_antigravity_kick_advances_stored_reset(self):
+        reset = 1_700_000_000
+        state = {
+            "services": {
+                "antigravity": {
+                    "expected_reset": reset,
+                    "kicked_reset": reset,
+                }
+            }
+        }
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 120):
+            quota_kicker.service_cycle("antigravity", reset, state, dry_run=False)
+
+        self.assertEqual(state["services"]["antigravity"]["expected_reset"], reset + 5 * 60 * 60)
 
     def test_cli_service_arg(self):
         with patch("sys.argv", ["quota_kicker.py", "--service", "antigravity", "--dry-run"]):
-            with patch.object(quota_kicker, "antigravity_reset", return_value=None):
-                with patch.object(quota_kicker, "save_state"):
+            with patch.object(quota_kicker, "load_state", return_value={"services": {}}):
+                with patch.object(quota_kicker, "antigravity_reset", return_value=None):
                     exit_code = quota_kicker.main()
                     self.assertEqual(exit_code, 0)
 
