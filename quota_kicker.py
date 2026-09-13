@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a new Codex/Claude CLI session shortly after an observed 5-hour reset.
+"""Start a new Codex/Claude/Antigravity CLI session shortly after an observed 5-hour reset.
 
 Run this program every minute or two using launchd (macOS) or Task Scheduler
 (Windows). It has no third-party dependencies and works with Python 3.9+.
@@ -21,6 +21,7 @@ APP_DIR = Path(os.environ.get("QUOTA_KICKER_HOME", Path.home() / ".quota-kicker"
 STATE = APP_DIR / "state.json"
 LOG = APP_DIR / "quota-kicker.log"
 CLAUDE_LIMITS = Path.home() / ".claude_limits.json"
+ANTIGRAVITY_LIMITS = Path.home() / ".antigravity_limits.json"
 PROMPT = "Reply with exactly: OK"
 GRACE_SECONDS = 75
 
@@ -58,9 +59,40 @@ def save_state(state: dict[str, Any]) -> None:
     temporary.replace(STATE)
 
 
+def find_executable(service: str) -> Optional[str]:
+    if service == "antigravity":
+        candidates = ["agy", "antigravity"]
+    else:
+        candidates = [service]
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            return found
+        local_fallback = Path.home() / ".local" / "bin" / name
+        if local_fallback.is_file() and os.access(local_fallback, os.X_OK):
+            return str(local_fallback)
+    return None
+
+
+def parse_timestamp(value: Any) -> Optional[int]:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            clean = value.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(clean).timestamp())
+        except (ValueError, TypeError):
+            pass
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def rpc_read_codex_limits() -> Optional[dict[str, Any]]:
     """Return Codex rate-limit snapshot, or None if this CLI/account does not expose it."""
-    executable = shutil.which("codex")
+    executable = find_executable("codex")
     if not executable:
         log("CODEX unavailable: executable not found")
         return None
@@ -133,13 +165,72 @@ def claude_reset() -> Optional[int]:
         return None
 
 
+def antigravity_reset() -> Optional[int]:
+    if not ANTIGRAVITY_LIMITS.exists():
+        return None
+    try:
+        data = json.loads(ANTIGRAVITY_LIMITS.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    recorded_at = data.get("recorded_at")
+    if not isinstance(recorded_at, (int, float)):
+        try:
+            recorded_at = int(ANTIGRAVITY_LIMITS.stat().st_mtime)
+        except OSError:
+            recorded_at = now()
+
+    # Look for 5-hour bucket in data["five_hour"], data["quota"], or data directly
+    quota: dict[str, Any] = {}
+    if isinstance(data.get("quota"), dict):
+        quota = data["quota"]
+    elif isinstance(data.get("five_hour"), dict):
+        quota = {"five_hour": data["five_hour"]}
+    else:
+        quota = data
+
+    # 1. Primary check: explicit 5-hour bucket
+    for key, bucket in quota.items():
+        if not isinstance(bucket, dict):
+            continue
+        key_lower = str(key).lower()
+        if "5h" in key_lower or "five" in key_lower or bucket.get("windowDurationMins") == 300:
+            ts = parse_timestamp(bucket.get("reset_time") or bucket.get("resets_at") or bucket.get("resetsAt"))
+            if ts:
+                return ts
+            secs = bucket.get("reset_in_seconds")
+            if isinstance(secs, (int, float)):
+                return int(recorded_at + secs)
+
+    # 2. Secondary check: any bucket with reset <= 5 hours away, ignoring weekly/monthly
+    for key, bucket in quota.items():
+        if not isinstance(bucket, dict):
+            continue
+        key_lower = str(key).lower()
+        if "week" in key_lower or "month" in key_lower:
+            continue
+        secs = bucket.get("reset_in_seconds")
+        if isinstance(secs, (int, float)) and 0 < secs <= 18300:
+            return int(recorded_at + secs)
+        ts = parse_timestamp(bucket.get("reset_time") or bucket.get("resets_at") or bucket.get("resetsAt"))
+        if ts and 0 < (ts - recorded_at) <= 18300:
+            return ts
+
+    return None
+
+
 def run_kick(service: str, dry_run: bool) -> bool:
-    executable = shutil.which(service)
+    executable = find_executable(service)
     if not executable:
         log(f"{service.upper()} unavailable: executable not found")
         return False
     if service == "codex":
         command = [executable, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-rules", "--ignore-user-config", "-C", str(APP_DIR), PROMPT]
+    elif service == "antigravity":
+        command = [executable, "-p", PROMPT]
     else:
         command = [executable, "--print", "--no-session-persistence", PROMPT]
     if dry_run:
@@ -177,7 +268,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="log due actions without running either CLI")
     parser.add_argument("--status", action="store_true", help="show state and exit")
-    parser.add_argument("--service", choices=("all", "codex", "claude"), default="all")
+    parser.add_argument("--service", choices=("all", "codex", "claude", "antigravity"), default="all")
     args = parser.parse_args()
     state = load_state()
     if args.status:
@@ -187,6 +278,8 @@ def main() -> int:
         service_cycle("codex", five_hour_reset(rpc_read_codex_limits()), state, args.dry_run)
     if args.service in ("all", "claude"):
         service_cycle("claude", claude_reset(), state, args.dry_run)
+    if args.service in ("all", "antigravity"):
+        service_cycle("antigravity", antigravity_reset(), state, args.dry_run)
     save_state(state)
     return 0
 
