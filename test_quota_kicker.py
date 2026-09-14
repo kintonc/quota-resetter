@@ -191,6 +191,54 @@ class TestQuotaKickerAntigravity(unittest.TestCase):
         self.assertEqual(antigravity["kicked_reset"], reset)
         self.assertEqual(antigravity["expected_reset"], reset + 76 + 5 * 60 * 60)
 
+    def test_codex_keeps_expired_reset_during_grace_period(self):
+        reset = 1_700_000_000
+        next_reset = reset + 5 * 60 * 60
+        state = {"services": {"codex": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 30):
+            with patch.object(quota_kicker, "run_kick") as mock_kick:
+                quota_kicker.service_cycle("codex", next_reset, state, dry_run=False)
+
+        mock_kick.assert_not_called()
+        self.assertEqual(state["services"]["codex"]["expected_reset"], reset)
+
+    def test_codex_keeps_expired_reset_after_failed_kick(self):
+        reset = 1_700_000_000
+        next_reset = reset + 5 * 60 * 60
+        state = {"services": {"codex": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 76):
+            with patch.object(quota_kicker, "run_kick", return_value=False):
+                quota_kicker.service_cycle("codex", next_reset, state, dry_run=False)
+
+        self.assertEqual(state["services"]["codex"]["expected_reset"], reset)
+        self.assertNotIn("kicked_reset", state["services"]["codex"])
+
+    def test_codex_accepts_new_reset_after_successful_kick(self):
+        reset = 1_700_000_000
+        next_reset = reset + 5 * 60 * 60
+        state = {"services": {"codex": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log"), patch.object(quota_kicker, "now", return_value=reset + 76):
+            with patch.object(quota_kicker, "run_kick", return_value=True):
+                quota_kicker.service_cycle("codex", next_reset, state, dry_run=False)
+
+        codex = state["services"]["codex"]
+        self.assertEqual(codex["kicked_reset"], reset)
+        self.assertEqual(codex["expected_reset"], next_reset)
+
+    def test_codex_ignores_one_second_reset_jitter(self):
+        reset = 1_700_000_000
+        state = {"services": {"codex": {"expected_reset": reset}}}
+
+        with patch.object(quota_kicker, "log") as mock_log:
+            with patch.object(quota_kicker, "now", return_value=reset - 60):
+                quota_kicker.service_cycle("codex", reset + 1, state, dry_run=False)
+
+        mock_log.assert_not_called()
+        self.assertEqual(state["services"]["codex"]["expected_reset"], reset)
+
     def test_claude_ignores_snapshot_from_kicked_window(self):
         kicked_reset = 1_700_000_000
         expected_reset = kicked_reset + 5 * 60 * 60

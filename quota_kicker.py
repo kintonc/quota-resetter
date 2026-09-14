@@ -25,6 +25,7 @@ ANTIGRAVITY_LIMITS = Path.home() / ".antigravity_limits.json"
 PROMPT = "Reply with exactly: OK"
 GRACE_SECONDS = 75
 FIVE_HOUR_SECONDS = 5 * 60 * 60
+RESET_JITTER_SECONDS = 1
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -320,23 +321,29 @@ def service_cycle(service: str, observed_reset: Optional[int], state: dict[str, 
         log(f"{service.upper()} observing next reset: {iso(observed_reset)}")
         return
     kicked = service_state.get("kicked_reset")
-    if service in ("claude", "antigravity") and isinstance(expected, int) and kicked == expected and now() >= expected:
+    current_time = now()
+    if service in ("claude", "antigravity") and isinstance(expected, int) and kicked == expected and current_time >= expected:
         next_reset = expected + FIVE_HOUR_SECONDS
         service_state["expected_reset"] = next_reset
         log(f"{service.upper()} next reset after previous kick: {iso(next_reset)}")
         return
-    # Act on the stored timestamp before accepting a newer backend timestamp.
-    if isinstance(expected, int) and now() >= expected + GRACE_SECONDS and kicked != expected:
-        if run_kick(service, dry_run):
-            if not dry_run:
-                service_state["kicked_reset"] = expected
-                if service in ("claude", "antigravity"):
-                    next_reset = now() + FIVE_HOUR_SECONDS
-                    service_state["expected_reset"] = next_reset
-                    log(f"{service.upper()} next reset after kick: {iso(next_reset)}")
-                    return
+    # Keep an expired reset pending until its kick succeeds. Codex may start
+    # reporting a sliding now-plus-five-hours value as soon as a window expires.
+    if isinstance(expected, int) and current_time >= expected and kicked != expected:
+        if current_time < expected + GRACE_SECONDS:
+            return
+        if not run_kick(service, dry_run) or dry_run:
+            return
+        service_state["kicked_reset"] = expected
+        if service in ("claude", "antigravity"):
+            next_reset = now() + FIVE_HOUR_SECONDS
+            service_state["expected_reset"] = next_reset
+            log(f"{service.upper()} next reset after kick: {iso(next_reset)}")
+            return
     if observed_reset and observed_reset != expected:
         if service in ("claude", "antigravity") and isinstance(kicked, int) and observed_reset <= kicked:
+            return
+        if service == "codex" and isinstance(expected, int) and abs(observed_reset - expected) <= RESET_JITTER_SECONDS:
             return
         service_state["expected_reset"] = observed_reset
         log(f"{service.upper()} next reset: {iso(observed_reset)}")
